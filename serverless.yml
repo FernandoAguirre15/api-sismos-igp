@@ -1,0 +1,37 @@
+org: fernandoaguirrer9zh
+service: api-sismos-igp
+
+provider:
+  name: aws
+  runtime: python3.12
+  memorySize: 1024
+  timeout: 30
+  iam:
+    role: arn:aws:iam::193025579155:role/LabRole   
+
+functions:
+  scrape_sismos:
+    handler: scrap_sismos.lambda_handler
+    package:
+      include:
+        - ./**
+    events:
+      - http:
+          path: /scrape/sismos
+          method: get
+          cors: true
+          integration: lambda
+
+resources:
+  Resources:
+    TablaSismosIGP:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: TablaSismosIGP
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
