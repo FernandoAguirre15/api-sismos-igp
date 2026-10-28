@@ -1,55 +1,61 @@
 import uuid
-import requests
-import boto3
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, timezone
 
-URL = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
+import boto3
+import requests
+
+API_URL = "https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/{anio}"
 TABLE_NAME = "TablaSismosIGP"
 MAX_SISMOS = 10
-DEFAULT_HEADERS = ["Reporte", "Referencia", "Fecha y hora local", "Magnitud"]
 
 
-def parse_sismos(html, limit=MAX_SISMOS):
-    """Extrae las primeras `limit` filas de la tabla de sismos."""
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if not table:
-        return None
+def obtener_sismos(anio):
+    """Descarga la lista de sismos de un anio desde la API del IGP."""
+    resp = requests.get(API_URL.format(anio=anio),
+                        headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
 
-    headers = [th.get_text(" ", strip=True) for th in table.find_all("th")]
 
-    rows = []
-    for tr in table.find_all("tr"):
-        cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if not cells:  # fila de encabezado u hoja vacia
-            continue
-        names = headers if len(headers) == len(cells) else DEFAULT_HEADERS
-        item = {}
-        for i, value in enumerate(cells):
-            key = names[i] if i < len(names) else f"Columna {i + 1}"
-            item[key] = value
-        rows.append(item)
-        if len(rows) == limit:
-            break
-    return rows
+def a_item(s):
+    """Convierte un sismo de la API en un item para DynamoDB."""
+    item = {
+        "codigo": s.get("codigo"),
+        "fecha_local": (s.get("fecha_local") or "")[:10],     # 2026-10-28
+        "hora_local": (s.get("hora_local") or "")[11:19],     # 12:30:45
+        "referencia": s.get("referencia"),
+        "magnitud": s.get("magnitud"),
+        "profundidad": s.get("profundidad"),                  # km
+        "latitud": s.get("latitud"),
+        "longitud": s.get("longitud"),
+        "intensidad": s.get("intensidad"),
+        "reporte_pdf": s.get("reporte_acelerometrico_pdf"),
+    }
+    return {k: v for k, v in item.items() if v not in (None, "")}
 
 
 def lambda_handler(event, context):
-    response = requests.get(URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-    if response.status_code != 200:
-        return {"statusCode": response.status_code,
-                "body": "Error al acceder a la pagina web"}
+    # Hora de Lima (UTC-5) para decidir el anio actual
+    anio = (datetime.now(timezone.utc) - timedelta(hours=5)).year
 
-    rows = parse_sismos(response.content)
-    if rows is None:
-        return {"statusCode": 404,
-                "body": "No se encontro la tabla en la pagina web"}
-    if not rows:
-        return {"statusCode": 404, "body": "La tabla no contiene sismos"}
+    try:
+        sismos = obtener_sismos(anio)
+        if len(sismos) < MAX_SISMOS:  # inicio de anio: completar con el anterior
+            sismos = obtener_sismos(anio - 1) + sismos
+    except Exception as e:
+        return {"statusCode": 502,
+                "body": f"Error al acceder a la API del IGP: {e}"}
+
+    if not sismos:
+        return {"statusCode": 404, "body": "No se encontraron sismos"}
+
+    # La API devuelve del mas antiguo al mas reciente: ordenar y tomar los 10 ultimos
+    sismos.sort(key=lambda s: s.get("idlistasismos") or 0, reverse=True)
+    rows = [a_item(s) for s in sismos[:MAX_SISMOS]]
 
     table = boto3.resource("dynamodb").Table(TABLE_NAME)
 
-    # Limpiar la tabla (paginando el scan) antes de insertar los nuevos datos
+    # Limpiar la tabla (con paginacion) antes de insertar los nuevos datos
     scan = table.scan(ProjectionExpression="id")
     items = scan["Items"]
     while "LastEvaluatedKey" in scan:
